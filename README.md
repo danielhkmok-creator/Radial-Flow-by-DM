@@ -4,6 +4,7 @@ Relative pedestrian-flow potential explorer for Hong Kong (GTFS + OpenStreetMap 
 Scores are relative model indicators, not observed pedestrian counts.
 
 Copyright (c) 2026 DM. All rights reserved.
+Test it online: https://radial-flow-by-dm.streamlit.app/
 
 ## Run locally
     pip install -r requirements.txt
