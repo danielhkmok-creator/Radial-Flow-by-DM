@@ -118,7 +118,8 @@ if result:
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Scheduled departures", summary["total_scheduled_departures"])
     m2.metric("Peak slot", summary["peak_30m_slot"] or "-")
-    m3.metric("Pass-through share", f"{(summary['target_pass_through_share'] or 0) * 100:.1f}%")
+    share_value = summary["target_pass_through_share"]
+    m3.metric("Pass-through share", "n/a" if share_value is None else f"{share_value * 100:.1f}%")
     m4.metric("Data quality", summary["data_quality"])
 
     components.html(result["map_html"], height=720, scrolling=False)

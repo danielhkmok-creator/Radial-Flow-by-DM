@@ -9,6 +9,7 @@ from __future__ import annotations
 # Standard-library imports used across the whole program.
 import argparse
 import csv
+import gzip
 import html
 import io
 import json
@@ -523,6 +524,37 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Pre-built Hong Kong POI snapshot (data/hk_pois.csv.gz, made by build_poi_snapshot.py)
+# Lets the app work without live Overpass calls, which cloud IPs often get blocked on.
+# ---------------------------------------------------------------------------
+SNAPSHOT_PATH = (Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()) / "data" / "hk_pois.csv.gz"
+_SNAPSHOT_ROWS: Optional[list[dict[str, Any]]] = None
+
+
+# Load the snapshot once per process (kept in memory); returns None when the file does not exist.
+def load_poi_snapshot() -> Optional[list[dict[str, Any]]]:
+    global _SNAPSHOT_ROWS
+    if _SNAPSHOT_ROWS is not None:
+        return _SNAPSHOT_ROWS or None
+    if not SNAPSHOT_PATH.exists():
+        _SNAPSHOT_ROWS = []
+        return None
+    rows: list[dict[str, Any]] = []
+    try:
+        with gzip.open(SNAPSHOT_PATH, "rt", encoding="utf-8", newline="") as file_object:
+            for row in csv.DictReader(file_object):
+                latitude, longitude = safe_float(row.get("lat")), safe_float(row.get("lon"))
+                if latitude is None or longitude is None:
+                    continue
+                rows.append({"id": f"{row.get('osm_type', 'osm')}:{row.get('osm_id', '')}",
+                             "lat": latitude, "lon": longitude,
+                             "category": row.get("category", ""), "name": row.get("name", "")})
+    except Exception:
+        rows = []
+    _SNAPSHOT_ROWS = rows
+    return rows or None
+
+
 # Main analysis engine
 # ---------------------------------------------------------------------------
 class FootfallAnalyzer:
@@ -538,6 +570,9 @@ class FootfallAnalyzer:
 
         # Overpass client: zero retries, so a slow mirror is abandoned after one timeout and the next is tried.
         self.overpass_client = HttpClient(config.timeout_seconds, retries=0, backoff=0.0)
+
+        # Where destinations came from: "snapshot", "overpass" or "none".
+        self.poi_source = "none"
 
         # Routes that could not be resolved by any router (excluded from scoring, reported in CSV/summary).
         self.failed_routes: list[dict[str, Any]] = []
@@ -807,6 +842,17 @@ class FootfallAnalyzer:
         latitude, longitude = self.config.subject.lat, self.config.subject.lng
         radius = int(self.config.radius_m)
 
+        # Preferred source: the pre-built snapshot (no network call, works on any host).
+        snapshot_rows = load_poi_snapshot()
+        if snapshot_rows is not None:
+            degree_margin = radius / 111000.0 * 1.3
+            nearby_rows = [r for r in snapshot_rows
+                           if abs(r["lat"] - latitude) <= degree_margin
+                           and abs(r["lon"] - longitude) <= degree_margin * 1.6]
+            self.poi_source = "snapshot"
+            self.log(f"Using POI snapshot: {len(snapshot_rows)} places loaded, {len(nearby_rows)} near target.")
+            return self.rank_destinations(destinations, nearby_rows, "OpenStreetMap snapshot"), True
+
         # Optional residential buildings clause for the Overpass query.
         residential_query = ""
         if self.config.include_residential_optional:
@@ -870,24 +916,37 @@ out center tags;
                 self.log(" | ".join(errors))
             return destinations, False
 
-        # Classify, de-duplicate and score every returned OSM element.
-        category_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        seen_positions: set[tuple[float, float, str]] = set()
+        # Normalise live Overpass elements to the same row format as the snapshot, then rank them.
+        normalized: list[dict[str, Any]] = []
         for element in payload.get("elements", []):
             center = element.get("center") or {"lat": element.get("lat"), "lon": element.get("lon")}
             element_latitude = safe_float(center.get("lat"))
             element_longitude = safe_float(center.get("lon"))
-            if element_latitude is None or element_longitude is None:
-                continue
-            point = Point(element_latitude, element_longitude)
-            distance = haversine_m(self.config.subject, point)
-            if distance > self.config.radius_m:
-                continue
             tags = element.get("tags") or {}
             category = classify_destination(tags)
-            if category is None:
+            if element_latitude is None or element_longitude is None or category is None:
+                continue
+            normalized.append({"id": f"{element.get('type', 'osm')}:{element.get('id', '')}",
+                               "lat": element_latitude, "lon": element_longitude,
+                               "category": category,
+                               "name": osm_name(tags, category.replace("_", " ").title())})
+        self.poi_source = "overpass"
+        return self.rank_destinations(destinations, normalized, "OpenStreetMap/Overpass"), True
+
+    # Filter by radius, de-duplicate, score, cap per category and keep the best max_destinations - 1 rows.
+    def rank_destinations(self, destinations: list[dict[str, Any]], rows: list[dict[str, Any]],
+                          source_label: str) -> list[dict[str, Any]]:
+        category_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        seen_positions: set[tuple[float, float, str]] = set()
+        for row in rows:
+            category = row["category"]
+            if category not in DESTINATION_WEIGHTS or category == "target_area":
                 continue
             if category == "residential" and not self.config.include_residential_optional:
+                continue
+            point = Point(row["lat"], row["lon"])
+            distance = haversine_m(self.config.subject, point)
+            if distance > self.config.radius_m:
                 continue
             deduplication_key = (round(point.lat, 5), round(point.lng, 5), category)
             if deduplication_key in seen_positions:
@@ -897,25 +956,25 @@ out center tags;
             base_weight = DESTINATION_WEIGHTS.get(category, 2.0)
             ranking_score = base_weight * math.exp(-distance / max(self.config.radius_m, 1))
             category_rows[category].append({
-                "id": f"{element.get('type', 'osm')}:{element.get('id', '')}",
-                "name": osm_name(tags, category.replace("_", " ").title()),
+                "id": row["id"],
+                "name": row["name"] or category.replace("_", " ").title(),
                 "point": point,
                 "category": category,
                 "straight_m": round(distance, 3),
                 "attraction_weight": round(base_weight, 6),
                 "ranking_score": round(ranking_score, 6),
-                "data_source": "OpenStreetMap/Overpass",
+                "data_source": source_label,
             })
 
         # Apply per-category caps, rank globally, and keep max_destinations - 1 (target uses one slot).
         candidate_destinations: list[dict[str, Any]] = []
-        for category, rows in category_rows.items():
-            rows.sort(key=lambda row: row["ranking_score"], reverse=True)
-            candidate_destinations.extend(rows[: DEFAULT_CATEGORY_CAPS.get(category, 3)])
-        candidate_destinations.sort(key=lambda row: row["ranking_score"], reverse=True)
+        for category, category_list in category_rows.items():
+            category_list.sort(key=lambda item: item["ranking_score"], reverse=True)
+            candidate_destinations.extend(category_list[: DEFAULT_CATEGORY_CAPS.get(category, 3)])
+        candidate_destinations.sort(key=lambda item: item["ranking_score"], reverse=True)
         destinations.extend(candidate_destinations[: max(0, self.config.max_destinations - 1)])
         self.log(f"Selected destinations: {len(destinations)}")
-        return destinations, True
+        return destinations
 
     # ------------------------------------------------------------------
     # Pedestrian routing (pure network calls: safe to run inside worker threads)
@@ -1223,9 +1282,11 @@ out center tags;
         routing_success_rate = (self.routing_successes / self.routing_attempts
                                 if self.routing_attempts else 0.0)
         failed_count = len(self.failed_routes)
-        if routing_success_rate >= 0.8 and osm_success and sources:
+        if not osm_success or not sources:
+            data_quality = "Low"
+        elif routing_success_rate >= 0.8 and failed_count == 0:
             data_quality = "High"
-        elif routing_success_rate >= 0.4 and sources:
+        elif routing_success_rate >= 0.4:
             data_quality = "Medium"
         else:
             data_quality = "Low"
@@ -1273,7 +1334,9 @@ out center tags;
             "time_profile": profile,
             "total_flow_potential_score": round(total_score, 6),
             "target_pass_through_score": round(pass_through_score, 6),
-            "target_pass_through_share": round(pass_through_score / total_score, 6) if total_score else None,
+            "target_pass_through_share": (round(pass_through_score / total_score, 6)
+                                          if total_score and len(pairs) >= 3 else None),
+            "poi_source": self.poi_source,
             "routing_attempt_count": self.routing_attempts,
             "routing_success_count": self.routing_successes,
             "routing_api_success_rate": round(routing_success_rate, 6),
@@ -1291,7 +1354,8 @@ out center tags;
     # ------------------------------------------------------------------
     # Floating "Location profile" HTML card shown on top of the map (branded with the new name).
     def statistics_panel(self, summary: dict[str, Any]) -> str:
-        pass_through_share = summary["target_pass_through_share"] or 0.0
+        share_value = summary["target_pass_through_share"]
+        pass_through_text = "n/a (fewer than 3 routes)" if share_value is None else f"{share_value * 100:.1f}%"
         rows = (
             ("Location", summary["subject_label"]),
             ("Period", f"{self.config.start_datetime:%Y-%m-%d %H:%M} to "
@@ -1303,7 +1367,8 @@ out center tags;
             ("Scheduled departures", summary["total_scheduled_departures"]),
             ("Peak slot", summary["peak_30m_slot"] or "-"),
             ("Pass-through routes", summary["pass_through_pair_count"]),
-            ("Pass-through share", f"{pass_through_share * 100:.1f}%"),
+            ("Pass-through share", pass_through_text),
+            ("POI source", summary["poi_source"]),
             ("Routing success", f"{summary['routing_api_success_rate'] * 100:.1f}%"),
             ("Routes failed (excluded)", summary["failed_route_count"]),
             ("Parallel workers", summary["parallel_workers"]),
