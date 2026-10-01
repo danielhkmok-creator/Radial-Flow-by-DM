@@ -36,3 +36,6 @@ output/
 
 # Streamlit
 .streamlit/secrets.toml
+
+!data/
+!data/hk_pois.csv
