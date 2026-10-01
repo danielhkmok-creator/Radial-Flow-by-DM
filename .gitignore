@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Python build / test
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# Environment / secrets
+.env
+.env.*
+*.key
+*.pem
+
+# App outputs
+output/
+.cache/
+.hk_footfall_cache/
+
+# Streamlit
+.streamlit/secrets.toml
